@@ -1,12 +1,12 @@
 """
-🐍 PyDevBot — Telegram AI Assistant for Python & Bot Developers
-Powered by Claude (Anthropic) | Built with python-telegram-bot v20+
+🐍 PyDevBot — Telegram AI for Python & Bot Developers
+100% offline, zero external API keys required.
+Powered by a hand-crafted expert knowledge base.
 """
 
 import os
+import random
 import logging
-import asyncio
-from typing import Optional
 from dotenv import load_dotenv
 
 from telegram import (
@@ -23,169 +23,66 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
-    ConversationHandler,
 )
-import anthropic
+
+from knowledge import (
+    SNIPPETS, EXPLANATIONS, BEST, KEYWORD_RESPONSES,
+    PTB_REFERENCE, AIOGRAM_REFERENCE, DEPLOY_GUIDE, TIPS,
+    SNIPPET_KEYS, EXPLAIN_KEYS, BEST_KEYS,
+)
 
 # ─────────────────────────────────────────────
-# Config & Logging
+# Setup
 # ─────────────────────────────────────────────
 load_dotenv()
-
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-MAX_HISTORY: int = int(os.getenv("MAX_HISTORY", "20"))   # messages per user
-MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "2048"))
+# Try multiple common variable names
+TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")
+    or os.getenv("TOKEN")
+    or ""
+)
 
-if not TELEGRAM_TOKEN or not ANTHROPIC_API_KEY:
-    raise EnvironmentError(
-        "❌  Missing TELEGRAM_BOT_TOKEN or ANTHROPIC_API_KEY in .env"
-    )
+# Debug: print all env var names so Railway logs show what was injected
+logger.info("Env vars present: %s", list(os.environ.keys()))
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+if not TOKEN:
+    logger.error("No token found! Set TELEGRAM_BOT_TOKEN in Railway Variables.")
+    raise EnvironmentError("Bot token missing. Set TELEGRAM_BOT_TOKEN in Railway Variables.")
 
-# ─────────────────────────────────────────────
-# System Prompt — the bot's soul
-# ─────────────────────────────────────────────
-SYSTEM_PROMPT = """You are PyDevBot — an elite AI assistant living inside Telegram, purpose-built for Python developers and Telegram bot engineers.
-
-## Your Identity
-- Name: PyDevBot 🐍
-- Persona: Senior Python engineer with 10+ years of experience, deep Telegram Bot API expertise, and a pragmatic, no-fluff coding style.
-- Tone: Friendly but precise. You talk like a senior dev pairing with a colleague — direct, helpful, occasionally witty. Never condescending.
-
-## Your Core Expertise
-1. **Python Development**
-   - Modern Python (3.10+): type hints, dataclasses, async/await, match statements
-   - Pythonic patterns, PEP compliance, clean architecture
-   - Popular libraries: FastAPI, SQLAlchemy, Pydantic, httpx, aiohttp, pytest, etc.
-   - Performance, profiling, debugging, packaging (pyproject.toml, poetry, uv)
-
-2. **Telegram Bot Development**
-   - python-telegram-bot (v20+ / PTB): Application, handlers, ConversationHandler, JobQueue
-   - aiogram (v3): FSM, routers, middlewares, filters
-   - Telegram Bot API: all methods, webhook vs polling, inline keyboards, inline queries, payments, Web Apps
-   - Advanced patterns: rate limiting, flood control, admin panels, multi-language bots
-   - Deployment: systemd, Docker, Heroku, Railway, VPS, webhooks behind nginx
-
-3. **Bot Architecture & Best Practices**
-   - State management, FSM design
-   - Database integration (SQLite, PostgreSQL, MongoDB, Redis)
-   - Background tasks, scheduling (APScheduler, JobQueue)
-   - Error handling, logging, monitoring
-   - Security: token safety, user validation, anti-spam
-
-4. **DevOps for Bots**
-   - Docker & docker-compose for bot deployment
-   - CI/CD pipelines
-   - Environment management, secrets, .env files
-
-## Response Style
-- **Always provide runnable code** when a code question is asked. Prefer modern, idiomatic Python.
-- Format code with proper syntax highlighting (```python blocks).
-- For complex topics, structure your answer: brief explanation → code → key notes.
-- Point out gotchas, common mistakes, and PTB/aiogram version differences when relevant.
-- If the user's question is vague, ask one clarifying question before diving in.
-- Keep answers focused. Don't pad with unnecessary text.
-
-## What You Don't Do
-- You don't help with anything outside Python / bot development / related DevOps.
-- If asked something unrelated, politely redirect: "I'm specialized for Python & Telegram bot dev — try asking me something in that space! 🐍"
-
-## Special Commands You Support
-Users can ask you to:
-- `/snippet <topic>` — give a ready-to-use code snippet
-- `/debug` — help debug their code (they paste it, you analyze)
-- `/explain <concept>` — deep-dive explanation of a concept
-- `/best <task>` — recommend the best library/approach for a task
-- `/ptb` — python-telegram-bot specific help
-- `/aiogram` — aiogram specific help
-"""
-
-# ─────────────────────────────────────────────
-# In-memory conversation history store
-# { user_id: [ {"role": ..., "content": ...}, ... ] }
-# ─────────────────────────────────────────────
-conversation_history: dict[int, list[dict]] = {}
-
-
-def get_history(user_id: int) -> list[dict]:
-    return conversation_history.setdefault(user_id, [])
-
-
-def add_to_history(user_id: int, role: str, content: str) -> None:
-    history = get_history(user_id)
-    history.append({"role": role, "content": content})
-    # Keep only the last MAX_HISTORY messages
-    if len(history) > MAX_HISTORY:
-        conversation_history[user_id] = history[-MAX_HISTORY:]
-
-
-def clear_history(user_id: int) -> None:
-    conversation_history[user_id] = []
-
-
-# ─────────────────────────────────────────────
-# Claude API call
-# ─────────────────────────────────────────────
-async def ask_claude(user_id: int, user_message: str) -> str:
-    add_to_history(user_id, "user", user_message)
-    history = get_history(user_id)
-
-    try:
-        response = await asyncio.to_thread(
-            client.messages.create,
-            model="claude-sonnet-4-20250514",
-            max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            messages=history,
-        )
-        assistant_reply = response.content[0].text
-        add_to_history(user_id, "assistant", assistant_reply)
-        return assistant_reply
-
-    except anthropic.APIError as e:
-        logger.error(f"Anthropic API error: {e}")
-        return "⚠️ API error. Please try again in a moment."
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        return "⚠️ Something went wrong. Please try again."
-
+logger.info("Token loaded OK (first 8 chars: %s...)", TOKEN[:8])
 
 # ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
-def split_message(text: str, limit: int = 4000) -> list[str]:
-    """Split long messages to respect Telegram's 4096-char limit."""
-    if len(text) <= limit:
-        return [text]
-    parts, current = [], ""
-    for line in text.split("\n"):
-        if len(current) + len(line) + 1 > limit:
-            parts.append(current)
-            current = line + "\n"
-        else:
-            current += line + "\n"
-    if current:
-        parts.append(current)
-    return parts
-
-
-async def send_long_message(
-    update: Update, text: str, parse_mode: Optional[str] = constants.ParseMode.MARKDOWN
-) -> None:
-    for part in split_message(text):
+async def send_safe(update: Update, text: str, parse_mode=constants.ParseMode.MARKDOWN) -> None:
+    """Send message, fall back to plain text on parse error."""
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+    for chunk in chunks:
         try:
-            await update.message.reply_text(part, parse_mode=parse_mode)
+            await update.message.reply_text(chunk, parse_mode=parse_mode)
         except Exception:
-            # Fallback: send without markdown if parsing fails
-            await update.message.reply_text(part, parse_mode=None)
+            await update.message.reply_text(chunk, parse_mode=None)
+
+
+def normalize(text: str) -> str:
+    return text.lower().strip()
+
+
+def keyword_match(text: str):
+    """Return first matching response for the user's message."""
+    t = normalize(text)
+    for keywords, response in KEYWORD_RESPONSES:
+        if any(kw in t for kw in keywords):
+            return response
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -194,262 +91,356 @@ async def send_long_message(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     keyboard = [
-        [
-            InlineKeyboardButton("📘 PTB Help", callback_data="quick_ptb"),
-            InlineKeyboardButton("⚡ aiogram Help", callback_data="quick_aiogram"),
-        ],
-        [
-            InlineKeyboardButton("🐍 Python Tips", callback_data="quick_python"),
-            InlineKeyboardButton("🚀 Deploy a Bot", callback_data="quick_deploy"),
-        ],
-        [
-            InlineKeyboardButton("🔧 Debug My Code", callback_data="quick_debug"),
-            InlineKeyboardButton("📦 Best Library?", callback_data="quick_best"),
-        ],
+        [InlineKeyboardButton("📘 Code Snippets",   callback_data="menu_snippets"),
+         InlineKeyboardButton("🧠 Explanations",    callback_data="menu_explain")],
+        [InlineKeyboardButton("🏆 Best Libraries",  callback_data="menu_best"),
+         InlineKeyboardButton("💡 Dev Tips",        callback_data="menu_tips")],
+        [InlineKeyboardButton("🤖 PTB Reference",   callback_data="menu_ptb"),
+         InlineKeyboardButton("⚡ aiogram Reference",callback_data="menu_aiogram")],
+        [InlineKeyboardButton("🚀 Deploy Guide",    callback_data="menu_deploy")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    welcome = (
-        f"👋 Hey *{user.first_name}*! I'm *PyDevBot* 🐍\n\n"
-        "Your personal AI engineer for *Python* and *Telegram Bot* development.\n\n"
-        "I can help you with:\n"
-        "• Building Telegram bots (PTB, aiogram)\n"
-        "• Python coding & architecture\n"
-        "• Debugging & code reviews\n"
-        "• Deployment & DevOps for bots\n\n"
-        "Just ask me anything or pick a topic below 👇"
-    )
     await update.message.reply_text(
-        welcome, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=reply_markup
+        f"👋 Hey *{user.first_name}*\\! I'm *PyDevBot* 🐍\n\n"
+        "Your offline AI\\-free expert for:\n"
+        "• Python development\n"
+        "• Telegram bot building \\(PTB & aiogram\\)\n"
+        "• Deployment & DevOps\n"
+        "• Debugging & best practices\n\n"
+        "Pick a topic below or just *ask me anything* 💬",
+        parse_mode=constants.ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
 # ─────────────────────────────────────────────
 # /help
 # ─────────────────────────────────────────────
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    help_text = (
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
         "🛠 *PyDevBot Commands*\n\n"
-        "*/start* — Welcome & quick topics\n"
-        "*/help* — Show this help message\n"
-        "*/new* — Clear chat history & start fresh\n"
-        "*/snippet <topic>* — Get a code snippet\n"
-        "  _e.g._ `/snippet inline keyboard`\n"
-        "*/debug* — Analyze & fix your code\n"
-        "  _(paste your code after the command)_\n"
-        "*/explain <concept>* — Deep-dive explanation\n"
-        "  _e.g._ `/explain ConversationHandler`\n"
-        "*/best <task>* — Best library recommendation\n"
-        "  _e.g._ `/best async database for bots`\n"
-        "*/ptb* — python\\-telegram\\-bot help hub\n"
-        "*/aiogram* — aiogram help hub\n\n"
-        "Or just *send any message* and I'll respond! 💬"
+        "*/start* — Main menu\n"
+        "*/help* — This message\n"
+        "*/snippet <topic>* — Code snippet\n"
+        "  `inline_keyboard` · `conversation_handler`\n"
+        "  `send_photo` · `schedule_job` · `webhook`\n"
+        "  `sqlite` · `fsm_aiogram` · `middleware_aiogram`\n"
+        "  `env` · `error_handler` · `pagination`\n"
+        "  `broadcast` · `decorator` · `typing_action`\n"
+        "  `inline_query`\n\n"
+        "*/explain <topic>* — Deep explanation\n"
+        "  `conversationhandler` · `webhook` · `fsm`\n"
+        "  `middleware` · `jobqueue` · `inline_keyboard`\n"
+        "  `filters` · `context_user_data` · `rate_limiting`\n\n"
+        "*/best <topic>* — Best library recommendation\n"
+        "  `database` · `http` · `scheduler`\n"
+        "  `deployment` · `bot_framework`\n\n"
+        "*/ptb* — python-telegram-bot reference card\n"
+        "*/aiogram* — aiogram v3 reference card\n"
+        "*/deploy* — Deployment guide\n"
+        "*/tip* — Random developer tip\n"
+        "*/snippets* — Browse all snippets\n\n"
+        "Or just *type your question* and I'll answer it! 💬"
     )
-    await update.message.reply_text(
-        help_text, parse_mode=constants.ParseMode.MARKDOWN_V2
-    )
-
-
-# ─────────────────────────────────────────────
-# /new — reset history
-# ─────────────────────────────────────────────
-async def new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    clear_history(update.effective_user.id)
-    await update.message.reply_text(
-        "🔄 *Chat history cleared!* Starting fresh.\nAsk me anything 🐍",
-        parse_mode=constants.ParseMode.MARKDOWN,
-    )
+    await send_safe(update, text)
 
 
 # ─────────────────────────────────────────────
 # /snippet
 # ─────────────────────────────────────────────
-async def snippet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    topic = " ".join(context.args) if context.args else None
-    if not topic:
-        await update.message.reply_text(
-            "📘 Usage: `/snippet <topic>`\n_e.g._ `/snippet inline keyboard with callbacks`",
-            parse_mode=constants.ParseMode.MARKDOWN,
-        )
+async def snippet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        keys = "\n".join(f"• `{k}`" for k in SNIPPET_KEYS)
+        await send_safe(update, f"📘 *Available Snippets:*\n\n{keys}\n\n_Usage:_ `/snippet inline_keyboard`")
         return
-    prompt = f"Give me a clean, production-ready Python code snippet for: **{topic}**. Include brief inline comments."
-    await update.message.chat.send_action(constants.ChatAction.TYPING)
-    reply = await ask_claude(update.effective_user.id, prompt)
-    await send_long_message(update, reply)
+
+    key = "_".join(context.args).lower().replace(" ", "_").replace("-", "_")
+    # Fuzzy: find first key that contains the search term
+    match = next((k for k in SNIPPETS if key in k or k in key), None)
+    if not match:
+        await send_safe(update, f"❓ No snippet found for `{key}`.\n\nType `/snippets` to see all available snippets.")
+        return
+
+    title, code = SNIPPETS[match]
+    await send_safe(update, f"{title}\n\n{code}")
 
 
 # ─────────────────────────────────────────────
-# /debug
+# /snippets — browse menu
 # ─────────────────────────────────────────────
-async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    code = " ".join(context.args) if context.args else None
-    msg = update.message.text.replace("/debug", "").strip()
-    code = msg or code
-
-    if not code:
-        await update.message.reply_text(
-            "🔧 *Debug mode*\nPaste your code right after the command:\n"
-            "`/debug <your code here>`\nOr just send the code as a message and ask me to debug it!",
-            parse_mode=constants.ParseMode.MARKDOWN,
-        )
-        return
-
-    prompt = f"Please debug and fix this Python/Telegram bot code. Explain what was wrong and show the corrected version:\n\n```python\n{code}\n```"
-    await update.message.chat.send_action(constants.ChatAction.TYPING)
-    reply = await ask_claude(update.effective_user.id, prompt)
-    await send_long_message(update, reply)
+async def snippets_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    buttons = []
+    row = []
+    for i, key in enumerate(SNIPPET_KEYS):
+        label = key.replace("_", " ").title()
+        row.append(InlineKeyboardButton(label, callback_data=f"snip_{key}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    await update.message.reply_text(
+        "📘 *Choose a snippet:*",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 # ─────────────────────────────────────────────
 # /explain
 # ─────────────────────────────────────────────
-async def explain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    concept = " ".join(context.args) if context.args else None
-    if not concept:
-        await update.message.reply_text(
-            "📖 Usage: `/explain <concept>`\n_e.g._ `/explain ConversationHandler states`",
-            parse_mode=constants.ParseMode.MARKDOWN,
-        )
+async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        keys = "\n".join(f"• `{k}`" for k in EXPLAIN_KEYS)
+        await send_safe(update, f"📖 *Explainable Topics:*\n\n{keys}\n\n_Usage:_ `/explain webhook`")
         return
-    prompt = f"Give a thorough but practical explanation of: **{concept}** in the context of Python/Telegram bot development. Include a code example."
-    await update.message.chat.send_action(constants.ChatAction.TYPING)
-    reply = await ask_claude(update.effective_user.id, prompt)
-    await send_long_message(update, reply)
+
+    key = "_".join(context.args).lower().replace(" ", "").replace("-", "").replace("_", "")
+    match = next((k for k in EXPLANATIONS if key in k or k in key), None)
+    if not match:
+        await send_safe(update, f"❓ No explanation found for `{'_'.join(context.args)}`.\n\nAvailable: {', '.join(f'`{k}`' for k in EXPLAIN_KEYS)}")
+        return
+
+    await send_safe(update, EXPLANATIONS[match])
 
 
 # ─────────────────────────────────────────────
 # /best
 # ─────────────────────────────────────────────
-async def best(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    task = " ".join(context.args) if context.args else None
-    if not task:
-        await update.message.reply_text(
-            "🏆 Usage: `/best <task>`\n_e.g._ `/best async HTTP client for bots`",
-            parse_mode=constants.ParseMode.MARKDOWN,
-        )
+async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        keys = "\n".join(f"• `{k}`" for k in BEST_KEYS)
+        await send_safe(update, f"🏆 *Best Library Topics:*\n\n{keys}\n\n_Usage:_ `/best database`")
         return
-    prompt = f"What is the best Python library or approach for: **{task}**? Compare top options briefly, then give a clear recommendation with a minimal example."
-    await update.message.chat.send_action(constants.ChatAction.TYPING)
-    reply = await ask_claude(update.effective_user.id, prompt)
-    await send_long_message(update, reply)
+
+    key = "_".join(context.args).lower().replace(" ", "_")
+    match = next((k for k in BEST if key in k or k in key), None)
+    if not match:
+        await send_safe(update, f"❓ No recommendation found for `{key}`.\n\nAvailable: {', '.join(f'`{k}`' for k in BEST_KEYS)}")
+        return
+
+    await send_safe(update, BEST[match])
 
 
 # ─────────────────────────────────────────────
-# /ptb & /aiogram — quick help hubs
+# /ptb / /aiogram / /deploy
 # ─────────────────────────────────────────────
-async def ptb_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    prompt = "Give me a quick reference card for python-telegram-bot v20+: the most important classes, patterns, and gotchas a developer should know. Format it clearly."
-    await update.message.chat.send_action(constants.ChatAction.TYPING)
-    reply = await ask_claude(update.effective_user.id, prompt)
-    await send_long_message(update, reply)
+async def ptb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_safe(update, PTB_REFERENCE)
 
+async def aiogram_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_safe(update, AIOGRAM_REFERENCE)
 
-async def aiogram_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    prompt = "Give me a quick reference card for aiogram v3: the most important concepts, Router/FSM/middleware patterns, and gotchas. Format it clearly with examples."
-    await update.message.chat.send_action(constants.ChatAction.TYPING)
-    reply = await ask_claude(update.effective_user.id, prompt)
-    await send_long_message(update, reply)
+async def deploy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_safe(update, DEPLOY_GUIDE)
 
 
 # ─────────────────────────────────────────────
-# Inline keyboard button callbacks
+# /tip
 # ─────────────────────────────────────────────
-QUICK_PROMPTS = {
-    "quick_ptb": "Give me a quick-start guide for python-telegram-bot v20+.",
-    "quick_aiogram": "Give me a quick-start guide for aiogram v3.",
-    "quick_python": "Give me 5 advanced Python tips that every bot developer should know.",
-    "quick_deploy": "How do I deploy a Telegram bot to a VPS using Docker and webhooks? Show a full example.",
-    "quick_debug": "What are the most common bugs and errors in Telegram bots and how do I fix them?",
-    "quick_best": "What are the best libraries for Telegram bot development in Python in 2024?",
+async def tip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_safe(update, random.choice(TIPS))
+
+
+# ─────────────────────────────────────────────
+# Inline keyboard callbacks
+# ─────────────────────────────────────────────
+MENU_RESPONSES = {
+    "menu_ptb":     PTB_REFERENCE,
+    "menu_aiogram": AIOGRAM_REFERENCE,
+    "menu_deploy":  DEPLOY_GUIDE,
 }
 
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    prompt = QUICK_PROMPTS.get(query.data)
-    if not prompt:
+    data = query.data
+
+    # Static menu responses
+    if data in MENU_RESPONSES:
+        chunks = [MENU_RESPONSES[data][i:i+4000] for i in range(0, len(MENU_RESPONSES[data]), 4000)]
+        for chunk in chunks:
+            try:
+                await query.message.reply_text(chunk, parse_mode=constants.ParseMode.MARKDOWN)
+            except Exception:
+                await query.message.reply_text(chunk, parse_mode=None)
         return
-    await query.message.reply_text("⏳ Fetching answer...")
-    await query.message.chat.send_action(constants.ChatAction.TYPING)
-    reply = await ask_claude(query.from_user.id, prompt)
-    for part in split_message(reply):
+
+    # Snippet browser
+    if data.startswith("snip_"):
+        key = data[5:]
+        if key in SNIPPETS:
+            title, code = SNIPPETS[key]
+            text = f"{title}\n\n{code}"
+            try:
+                await query.message.reply_text(text, parse_mode=constants.ParseMode.MARKDOWN)
+            except Exception:
+                await query.message.reply_text(text, parse_mode=None)
+        return
+
+    # Snippet menu button
+    if data == "menu_snippets":
+        buttons = []
+        row = []
+        for i, key in enumerate(SNIPPET_KEYS):
+            label = key.replace("_", " ").title()
+            row.append(InlineKeyboardButton(label, callback_data=f"snip_{key}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        await query.message.reply_text(
+            "📘 *Choose a snippet:*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # Explain menu button
+    if data == "menu_explain":
+        buttons = []
+        row = []
+        for i, key in enumerate(EXPLAIN_KEYS):
+            label = key.replace("_", " ").title()
+            row.append(InlineKeyboardButton(label, callback_data=f"exp_{key}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        await query.message.reply_text(
+            "🧠 *Choose a topic to explain:*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # Explain item
+    if data.startswith("exp_"):
+        key = data[4:]
+        if key in EXPLANATIONS:
+            try:
+                await query.message.reply_text(EXPLANATIONS[key], parse_mode=constants.ParseMode.MARKDOWN)
+            except Exception:
+                await query.message.reply_text(EXPLANATIONS[key], parse_mode=None)
+        return
+
+    # Best menu button
+    if data == "menu_best":
+        buttons = [[InlineKeyboardButton(k.replace("_"," ").title(), callback_data=f"best_{k}")] for k in BEST_KEYS]
+        await query.message.reply_text(
+            "🏆 *Choose a topic:*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # Best item
+    if data.startswith("best_"):
+        key = data[5:]
+        if key in BEST:
+            try:
+                await query.message.reply_text(BEST[key], parse_mode=constants.ParseMode.MARKDOWN)
+            except Exception:
+                await query.message.reply_text(BEST[key], parse_mode=None)
+        return
+
+    # Tips menu button
+    if data == "menu_tips":
+        keyboard = [[InlineKeyboardButton("🎲 Random Tip", callback_data="random_tip")]]
+        tip = random.choice(TIPS)
         try:
-            await query.message.reply_text(part, parse_mode=constants.ParseMode.MARKDOWN)
+            await query.message.reply_text(
+                tip + "\n\n_Tap below for another tip:_",
+                parse_mode=constants.ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
         except Exception:
-            await query.message.reply_text(part, parse_mode=None)
+            await query.message.reply_text(tip)
+        return
+
+    if data == "random_tip":
+        keyboard = [[InlineKeyboardButton("🎲 Another Tip", callback_data="random_tip")]]
+        tip = random.choice(TIPS)
+        try:
+            await query.message.reply_text(
+                tip + "\n\n_Tap below for another tip:_",
+                parse_mode=constants.ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        except Exception:
+            await query.message.reply_text(tip)
+        return
 
 
 # ─────────────────────────────────────────────
-# General message handler
+# General message handler — keyword engine
 # ─────────────────────────────────────────────
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_message = update.message.text
-    user_id = update.effective_user.id
+FALLBACK_RESPONSES = [
+    "🤔 I didn't quite catch that. Try asking about:\n• `inline keyboard` · `conversation handler`\n• `webhook` · `database` · `async`\n• `deploy` · `error` · `schedule`\n\nOr type /help to see all commands.",
+    "🐍 Not sure what you mean. Try something like:\n`How do I send a photo?` or `explain FSM`\n\nType /help for all commands.",
+    "❓ I don't have an answer for that one yet.\n\nTry `/snippet`, `/explain`, or `/best` — I know a lot about those! 💪",
+]
 
-    await update.message.chat.send_action(constants.ChatAction.TYPING)
-    reply = await ask_claude(user_id, user_message)
-    await send_long_message(update, reply)
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text
+
+    response = keyword_match(text)
+    if response:
+        await send_safe(update, response)
+    else:
+        await send_safe(update, random.choice(FALLBACK_RESPONSES))
 
 
 # ─────────────────────────────────────────────
 # Error handler
 # ─────────────────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Update {update} caused error: {context.error}")
+    logger.error(f"Update caused error: {context.error}", exc_info=context.error)
 
 
 # ─────────────────────────────────────────────
-# Bot setup & run
+# Post-init: register commands in Telegram menu
 # ─────────────────────────────────────────────
 async def post_init(application: Application) -> None:
-    """Set bot commands in Telegram menu."""
-    commands = [
-        BotCommand("start", "👋 Welcome & quick topics"),
-        BotCommand("help", "🛠 Show all commands"),
-        BotCommand("new", "🔄 Clear chat & start fresh"),
-        BotCommand("snippet", "📘 Get a code snippet"),
-        BotCommand("debug", "🔧 Debug your code"),
-        BotCommand("explain", "📖 Explain a concept"),
-        BotCommand("best", "🏆 Best library recommendation"),
-        BotCommand("ptb", "🤖 python-telegram-bot help"),
-        BotCommand("aiogram", "⚡ aiogram help"),
-    ]
-    await application.bot.set_my_commands(commands)
-    logger.info("✅ Bot commands registered.")
+    await application.bot.set_my_commands([
+        BotCommand("start",    "👋 Main menu"),
+        BotCommand("help",     "🛠 All commands"),
+        BotCommand("snippet",  "📘 Code snippet"),
+        BotCommand("snippets", "📚 Browse all snippets"),
+        BotCommand("explain",  "🧠 Explain a concept"),
+        BotCommand("best",     "🏆 Best library recommendation"),
+        BotCommand("ptb",      "🤖 PTB reference card"),
+        BotCommand("aiogram",  "⚡ aiogram reference card"),
+        BotCommand("deploy",   "🚀 Deployment guide"),
+        BotCommand("tip",      "💡 Random dev tip"),
+    ])
+    logger.info("✅ Commands registered.")
 
 
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
 def main() -> None:
-    logger.info("🚀 Starting PyDevBot...")
+    logger.info("🚀 Starting PyDevBot (offline mode)...")
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
-    # Command handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("new", new_chat))
-    app.add_handler(CommandHandler("snippet", snippet))
-    app.add_handler(CommandHandler("debug", debug))
-    app.add_handler(CommandHandler("explain", explain))
-    app.add_handler(CommandHandler("best", best))
-    app.add_handler(CommandHandler("ptb", ptb_help))
-    app.add_handler(CommandHandler("aiogram", aiogram_help))
-
-    # Inline button callbacks
-    app.add_handler(CallbackQueryHandler(button_callback))
-
-    # General message handler (must be last)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Error handler
+    app.add_handler(CommandHandler("start",    start))
+    app.add_handler(CommandHandler("help",     help_cmd))
+    app.add_handler(CommandHandler("snippet",  snippet_cmd))
+    app.add_handler(CommandHandler("snippets", snippets_menu))
+    app.add_handler(CommandHandler("explain",  explain_cmd))
+    app.add_handler(CommandHandler("best",     best_cmd))
+    app.add_handler(CommandHandler("ptb",      ptb_cmd))
+    app.add_handler(CommandHandler("aiogram",  aiogram_cmd))
+    app.add_handler(CommandHandler("deploy",   deploy_cmd))
+    app.add_handler(CommandHandler("tip",      tip_cmd))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("✅ PyDevBot is running! Press Ctrl+C to stop.")
+    logger.info("✅ PyDevBot is live! Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
